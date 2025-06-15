@@ -21,8 +21,8 @@ if [ ! -f .env ]; then
         exit 1
     else
         echo -e "${RED}❌ backend/env.example not found. Cannot create .env file.${NC}"
-        exit 1
-    fi
+    exit 1
+fi
 fi
 
 # Function to check if a port is in use
@@ -39,10 +39,10 @@ if check_port 8000; then
     echo -e "${YELLOW}⚠️  Port 8000 is already in use. Backend might be running.${NC}"
 else
     echo -e "${BLUE}Starting backend server...${NC}"
-    cd backend
+cd backend
     uvicorn main:app --reload --host 0.0.0.0 --port 8000 &
-    BACKEND_PID=$!
-    cd ..
+BACKEND_PID=$!
+cd ..
     echo -e "${GREEN}✅ Backend started (PID: $BACKEND_PID)${NC}"
 fi
 
@@ -55,10 +55,10 @@ if check_port 3000; then
     echo -e "${YELLOW}⚠️  Port 3000 is already in use. Frontend might be running.${NC}"
 else
     echo -e "${BLUE}Starting frontend...${NC}"
-    cd frontend
-    npm run dev &
-    FRONTEND_PID=$!
-    cd ..
+cd frontend
+npm run dev &
+FRONTEND_PID=$!
+cd ..
     echo -e "${GREEN}✅ Frontend started (PID: $FRONTEND_PID)${NC}"
 fi
 
