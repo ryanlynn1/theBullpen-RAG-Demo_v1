@@ -7,7 +7,7 @@ azure-core==1.29.5
 pydantic==2.5.0
 python-multipart==0.0.6
 httpx==0.25.2
-sse-starlette==1.8.1
+sse-starlette==1.8.1 
 pypdf
 python-docx
 tiktoken

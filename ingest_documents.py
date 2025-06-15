@@ -37,6 +37,19 @@ from langchain_community.vectorstores.azuresearch import AzureSearch
 from langchain.docstore.document import Document
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
+# --- NEW: Imports for custom index creation ---
+from azure.core.credentials import AzureKeyCredential
+from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.indexes.models import (
+    SearchIndex,
+    SearchField,
+    SearchFieldDataType,
+    VectorSearch,
+    VectorSearchProfile,
+    HnswAlgorithmConfiguration,
+)
+# --- END NEW ---
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -78,6 +91,70 @@ if missing_vars:
 
 # Set AZURE_OPENAI_API_KEY for LangChain compatibility
 os.environ["AZURE_OPENAI_API_KEY"] = AZURE_OPENAI_KEY
+
+# ---------------------------------------------------------------------------
+# NEW: Index creation logic
+# ---------------------------------------------------------------------------
+def create_search_index():
+    """Defines and creates a new vector-enabled search index."""
+    print(f"Connecting to Search Index client with endpoint: {AZURE_SEARCH_ENDPOINT}")
+    credential = AzureKeyCredential(AZURE_SEARCH_KEY)
+    index_client = SearchIndexClient(
+        endpoint=AZURE_SEARCH_ENDPOINT, credential=credential
+    )
+
+    # Define the fields for the index
+    fields = [
+        SearchField(name="id", type=SearchFieldDataType.String, key=True),
+        SearchField(name="content", type=SearchFieldDataType.String, searchable=True),
+        SearchField(name="metadata", type=SearchFieldDataType.String, searchable=True),
+        # New vector field for content embeddings
+        SearchField(
+            name="content_vector",
+            type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+            searchable=True,
+            vector_search_dimensions=1536,  # Dimension for text-embedding-ada-002
+            vector_search_profile_name="my-hnsw-profile",
+        ),
+    ]
+
+    # Define the vector search profile
+    vector_search = VectorSearch(
+        profiles=[
+            VectorSearchProfile(
+                name="my-hnsw-profile",
+                algorithm_configuration_name="my-hnsw-config",
+            )
+        ],
+        algorithms=[
+            HnswAlgorithmConfiguration(
+                name="my-hnsw-config",
+                kind="hnsw",
+            )
+        ],
+    )
+
+    print(f"Defining new index '{AZURE_SEARCH_INDEX}'...")
+    index = SearchIndex(
+        name=AZURE_SEARCH_INDEX, fields=fields, vector_search=vector_search
+    )
+
+    # Delete the index if it already exists
+    try:
+        print(f"Checking for and deleting existing index '{AZURE_SEARCH_INDEX}' to ensure a fresh start...")
+        index_client.delete_index(AZURE_SEARCH_INDEX)
+        print(f"   - Deleted existing index.")
+    except Exception as e:
+        print(f"   - No existing index to delete or an error occurred: {e}")
+
+    # Create the new index
+    try:
+        print("Creating new vector-enabled index...")
+        index_client.create_index(index)
+        print("✅ Index created successfully.")
+    except Exception as e:
+        print(f"❌ Failed to create index: {e}")
+        raise
 
 # ---------------------------------------------------------------------------
 # Loader helpers
@@ -150,7 +227,15 @@ def chunk_documents(documents: List[Document]) -> List[Document]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("Loading documents from Blob Storage…")
+    # --- NEW: Create the index before doing anything else ---
+    try:
+        create_search_index()
+    except Exception as e:
+        print("Halting ingestion due to failure in index creation.")
+        return
+    # --- END NEW ---
+
+    print("\nLoading documents from Blob Storage…")
     raw_docs = load_blob_documents()
     print(f"Loaded {len(raw_docs)} raw documents")
 
@@ -165,34 +250,53 @@ def main() -> None:
         chunk_size=16,  # Use a smaller chunk size to manage request size
     )
 
-    print("Connecting to / creating Azure AI Search vector store…")
-    vector_store = AzureSearch(
-        azure_search_endpoint=AZURE_SEARCH_ENDPOINT,
-        azure_search_key=AZURE_SEARCH_KEY,
+    print("Manually creating and uploading documents with vectors...")
+    # Use direct Azure Search client instead of LangChain's AzureSearch
+    from azure.search.documents import SearchClient
+    search_client = SearchClient(
+        endpoint=AZURE_SEARCH_ENDPOINT,
         index_name=AZURE_SEARCH_INDEX,
-        embedding_function=embeddings.embed_query,
+        credential=AzureKeyCredential(AZURE_SEARCH_KEY)
     )
-    
-    # --- FIX: Add robust retry logic for adding documents ---
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-    def add_documents_with_retry(docs_to_add):
-        """A wrapper function to apply tenacity retry logic."""
-        print(f"Attempting to add {len(docs_to_add)} documents to the index...")
-        vector_store.add_documents(documents=docs_to_add)
 
-    print("Adding documents to the index with retry logic (this may take a while)…")
-    # To avoid hitting limits, add documents in smaller batches
-    batch_size = 100 
+    # Process documents in batches and manually create the vector documents
+    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
+    def upload_batch_with_vectors(batch_docs):
+        """Manually create documents with vectors and upload them."""
+        print(f"Processing batch of {len(batch_docs)} documents...")
+        
+        # Generate embeddings for the batch
+        texts = [doc.page_content for doc in batch_docs]
+        vectors = embeddings.embed_documents(texts)
+        
+        # Create documents for Azure Search
+        search_docs = []
+        for i, doc in enumerate(batch_docs):
+            search_doc = {
+                "id": f"doc_{hash(doc.page_content)}_{i}",  # Create unique ID
+                "content": doc.page_content,
+                "metadata": str(doc.metadata),  # Convert metadata dict to string
+                "content_vector": vectors[i]  # Add the vector embedding
+            }
+            search_docs.append(search_doc)
+        
+        # Upload to Azure Search
+        result = search_client.upload_documents(documents=search_docs)
+        print(f"   - Uploaded {len(search_docs)} documents with vectors")
+        return result
+
+    print("Adding documents to the index with vectors (this may take a while)…")
+    # Process documents in smaller batches to avoid rate limits
+    batch_size = 50  # Smaller batch size since we're doing embedding generation
     for i in range(0, len(docs), batch_size):
         batch = docs[i:i + batch_size]
         try:
-            add_documents_with_retry(batch)
+            upload_batch_with_vectors(batch)
             print(f"✅ Successfully added batch {i//batch_size + 1}/{(len(docs)-1)//batch_size + 1}")
         except Exception as e:
             print(f"❌ Failed to add a batch after several retries: {e}")
             print("Moving to the next batch.")
             continue
-    # --- END FIX ---
     
     print("✅ Ingestion complete!")
 
